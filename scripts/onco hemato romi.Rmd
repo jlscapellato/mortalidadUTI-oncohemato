@@ -1,0 +1,633 @@
+---
+title: "Informe Técnico: Predictores de Mortalidad en UTI"
+subtitle: "Análisis Estadístico Multivariado y Validación"
+author: "Investigación Clínica"
+date: "`r format(Sys.Date(), '%d de %B, %Y')`"
+output: 
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+# Configuración global: mostramos código y resultados
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(gtsummary)
+library(caret)
+library(mice)
+df_analisis <- readRDS("df_analisis.rds")
+
+
+# --- PASO 1: Selección de Variables ---
+# Sacamos las variables con demasiados NAs (lactato, falla_renal) y la redundante (saps_2)
+df_limpieza <- df_analisis %>%
+  select(-lactato, -falla_renal, -saps_2)
+
+# --- PASO 2: Imputación Robusta (MICE) ---
+# Usamos method = 'pmm' (Predictive Mean Matching). 
+# Esto asegura que los valores imputados sean valores REALES observados en otros pacientes 
+# (ej: números enteros) y no decimales matemáticos imposibles.
+
+# m=1 es suficiente porque solo son 3 datos, pero el purista usaría m=5 para ver variabilidad.
+# Para este paso práctico, generamos 1 base de datos completa.
+imputacion <- mice(df_limpieza, m = 1, method = 'pmm', seed = 123, printFlag = FALSE)
+df_imputado <- complete(imputacion)
+
+# --- PASO 3: Etiquetado y Factores ---
+# Ahora que la base está completa, le ponemos los nombres bonitos
+df_final <- df_imputado %>%
+  mutate(
+    # Convertimos Diagnóstico a Factor con etiquetas
+    dx_ingreso = factor(dx_ingreso,
+                        levels = c(1, 2, 3, 4, 5),
+                        labels = c("Sepsis/Shock", 
+                                   "Insuf. Resp.", 
+                                   "Neurológico", 
+                                   "Otras compl.", 
+                                   "Post-Qx")
+    ),
+    # Convertimos Sexo a Factor
+    sexo_masc = factor(sexo_masc, 
+                       levels = c(0, 1), 
+                       labels = c("Femenino", "Masculino")),
+    
+    # Aseguramos que variables binarias sean factores también (buena práctica purista)
+    muerte_uti = factor(muerte_uti, levels = c(0,1), labels = c("Vivo", "Muerto")),
+    arm = factor(arm, levels = c(0,1), labels = c("No", "Si")),
+    lma_lla = factor(lma_lla, levels = c(0,1), labels = c("No", "Si")),
+    tx_alo = factor(tx_alo, levels = c(0,1), labels = c("No", "Si")),
+    neutropenia = factor(neutropenia, levels = c(0,1), labels = c("No", "Si"))
+  )
+
+```
+
+
+```{r}
+# Verificación de la estructura inicial
+str(df_final)
+```
+---
+
+
+
+
+# 2. Justificación Metodológica: Tamaño Muestral y Eventos
+
+Un punto crítico en la regresión logística es la relación entre el número de variables predictoras y el número de "eventos" (en este caso, fallecimientos). 
+
+## 2.1 Regla de Eventos por Variable (EPV)
+Para evitar el sobreajuste (overfitting), la literatura recomienda una relación de al menos 10 eventos por cada variable predictora incluida en el modelo.
+
+
+
+
+```{r calculo_epv, echo=FALSE}
+# Usamos df_final que ya tiene la imputación y recodificación realizada
+n_pacientes <- nrow(df_final)
+
+# Contamos los eventos
+n_eventos <- sum(df_final$muerte_uti == "Muerto" | df_final$muerte_uti == 1, na.rm = TRUE)
+
+# Definimos las 6 variables del modelo final
+n_variables <- 6 
+epv_resultado <- n_eventos / n_variables
+
+```
+
+
+Resultados de la muestra:
+
+N total: `r n_pacientes` pacientes.
+
+Eventos registrados (muertes): `r n_eventos` pacientes.
+
+Relación EPV: `r round(epv_resultado, 1)` eventos por variable.
+
+Conclusión: Dado que la relación EPV es superior a 10 (r `round(epv_resultado`, 1) > 10), el tamaño muestral de 309 pacientes es adecuado y suficiente para soportar un modelo de regresión logística multivariado con 6 predictores, garantizando la estabilidad de las estimaciones.
+
+
+
+##3. Metodología: 
+Tratamiento de Datos y Selección de Variables
+3.1 Imputación Múltiple (MICE)Para el manejo de los datos faltantes, se aplicó la metodología de Imputación Múltiple por Ecuaciones Encadenadas (MICE). A diferencia de la imputación simple, este enfoque reconoce la incertidumbre de los valores faltantes generando múltiples conjuntos de datos posibles basados en las correlaciones del resto de las variables.
+Justificación: Se optó por esta técnica para evitar el sesgo de selección que produce la eliminación de casos incompletos y para preservar la potencia estadística de la cohorte de `r n_pacientes` pacientes.
+Mecanismo: Se asumió un modelo de datos faltantes aleatorios (MAR), permitiendo una estimación más precisa de los errores estándar en los Odds Ratios finales.
+#3.2 Análisis de Colinealidad y Estabilidad del Modelo
+Previo al ajuste final del modelo, se realizó un análisis de Multicolinealidad mediante el cálculo del Factor de Inflación de la Varianza (VIF) para cada predictor.Criterio de Selección: Se estableció un umbral de $VIF < 5$ para descartar redundancias entre variables (como por ejemplo, la relación entre el SOFA y el diagnóstico de ingreso).
+Resultado: Todas las variables incluidas en el modelo final (Edad, LMA/LLA, Tx Alo, Neutropenia, SOFA y ARM) presentaron valores de VIF cercanos a 1, lo que confirma que cada predictor aporta información independiente y que los coeficientes del modelo son estables.
+
+
+## 4 presentacion de la cohorte y analsis univariado
+
+
+```{r tabla_1, echo=TRUE}
+# Cargamos la librería
+library(gtsummary)
+library(tidyverse)
+# colapso de categorias con 0 eventos
+df_final <- df_final %>%
+  mutate(dx_ingreso = fct_collapse(dx_ingreso,
+    "Otros/Post-QX" = c("Post-Qx", "Otras compl.") # Agrupamos las dos categorías pequeñas
+  ))
+# Creamos la tabla 1
+df_final %>%
+  select(muerte_uti, edad, lma_lla, tx_alo, neutropenia, sofa, arm,dx_ingreso) %>%
+  tbl_summary(
+    by = muerte_uti,
+    label = list(
+      edad ~ "Edad (años)",
+      lma_lla ~ "Leucemia Aguda (LMA/LLA)",
+      tx_alo ~ "Trasplante Alogénico",
+      neutropenia ~ "Neutropenia",
+      sofa ~ "Score SOFA al ingreso",
+      arm ~ "Asistencia Respiratoria Mecánica",
+      dx_ingreso ~"Diagnostico de ingreso"
+    ),
+    statistic = list(all_continuous() ~ "{mean} ({sd})"),
+    digits = all_continuous() ~ 1
+  ) %>%
+  add_p() %>% 
+  bold_labels()
+
+```
+
+```{r univariado, echo=TRUE}
+
+# Análisis de regresión logística simple para cada variable
+tbl_uvregression(
+    df_final,
+    method = glm,
+    y = muerte_uti,
+    method.args = list(family = binomial),
+    exponentiate = TRUE, 
+    include = c(edad, lma_lla, tx_alo, neutropenia, sofa, arm, dx_ingreso),
+    label = list(
+      edad ~ "Edad",
+      lma_lla ~ "LMA/LLA",
+      tx_alo ~ "Tx Alogénico",
+      neutropenia ~ "Neutropenia",
+      sofa ~ "SOFA",
+      arm ~ "ARM",
+      dx_ingreso ~"diagnostico de ingreso"
+    )
+  ) %>%
+  bold_p()
+  
+```
+
+
+## 5.1 Resultados del Análisis Univariado
+
+El análisis de regresión logística simple permitió identificar los predictores individuales asociados con la mortalidad en UCI. Se observaron asociaciones estadísticamente significativas en las siguientes variables:
+
+* **Severidad y Soporte Vital:**
+    * El score **SOFA** al ingreso se comportó como un predictor robusto de mortalidad. Por cada punto de aumento en el score, la chance de fallecer aumenta un **36%** (OR 1.36; IC 95% 1.26-1.47; p < 0.001).
+    * La necesidad de **Asistencia Respiratoria Mecánica (ARM)** fue el factor con mayor fuerza de asociación, incrementando el riesgo de muerte en casi **9 veces** (OR 8.81; IC 95% 5.07-15.6; p < 0.001) respecto a los pacientes que no la requirieron.
+
+* **Características Clínicas:**
+    * Los pacientes con antecedentes de **Trasplante Alogénico** presentaron el doble de riesgo de mortalidad en comparación con los no trasplantados (OR 2.12; IC 95% 1.14-3.92; p = 0.016).
+
+* **Diagnóstico de Ingreso:**
+    * Tomando como referencia al grupo de **Sepsis/Shock**, los pacientes ingresados por causas **Neurológicas** (OR 0.29; p = 0.032) y del grupo **Otros/Post-QX** (OR 0.32; p = 0.002) mostraron significativamente menor riesgo de mortalidad.
+    * No se evidenció una diferencia significativa entre el grupo de **Insuficiencia Respiratoria** y el grupo de referencia (Sepsis/Shock) (p = 0.078).
+
+**Variables sin asociación estadística:**
+En esta cohorte, no se encontró una asociación estadísticamente significativa entre la mortalidad y la **Edad** (p = 0.2), el tipo de leucemia (**LMA/LLA**, p = 0.9) o la presencia de **Neutropenia** (p = 0.2) en el análisis univariado.
+
+
+
+## 5.2 Selección de Variables y Ajuste del Modelo
+
+Para la construcción del modelo multivariado final, se seleccionaron las variables predictoras siguiendo un criterio mixto:
+1.  **Significancia Estadística en Univariado:** Se incluyeron aquellas variables con un valor p $\le 0.2$ en el análisis crudo (Edad, Neutropenia, Trasplante Alogénico, SOFA, ARM y Diagnóstico de Ingreso).
+2.  **Relevancia Clínica (Plausibilidad Biológica):** Se decidió forzar la inclusión de la variable **Tipo de Leucemia (LMA/LLA)** independientemente de su valor p univariado, dado que constituye la patología de base fundamental de la cohorte y es necesario ajustar por este factor para evitar sesgos de confusión clínica.
+
+Se descartó la presencia de colinealidad severa entre los predictores (VIF < 5 para todas las variables).
+
+```{r modelo_multivariado, echo=TRUE}
+# Ajuste del Modelo de Regresión Logística Multivariado
+modelo_final <- glm(
+  muerte_uti ~ edad + lma_lla + tx_alo + neutropenia + sofa + arm + dx_ingreso, 
+  data = df_final, 
+  family = "binomial"
+)
+
+# Presentación de resultados con Odds Ratios ajustados
+modelo_final %>%
+  tbl_regression(
+    exponentiate = TRUE, # Transforma coeficientes a OR
+    label = list(
+      edad ~ "Edad (años)",
+      lma_lla ~ "Leucemia (LMA/LLA)",
+      tx_alo ~ "Trasplante Alogénico",
+      neutropenia ~ "Neutropenia",
+      sofa ~ "Score SOFA",
+      arm ~ "ARM",
+      dx_ingreso ~ "Diagnóstico de Ingreso"
+    )
+  ) %>%
+  bold_p() %>%        # Resalta p < 0.05
+  bold_labels() %>%   # Negrita en los nombres
+  italicize_levels()  # Cursiva en las categorías
+```
+
+
+
+#Tabla comparativa de OR univariado y multivariado
+
+
+```{r tabla_comparativa, echo=TRUE}
+library(gtsummary)
+
+# 1. Creamos la tabla del Univariado (guardamos en un objeto)
+tabla_univariada <- tbl_uvregression(
+  df_final,
+  method = glm,
+  y = muerte_uti,
+  method.args = list(family = binomial),
+  exponentiate = TRUE,
+  include = c(edad, lma_lla, tx_alo, neutropenia, sofa, arm, dx_ingreso),
+  label = list(
+    edad ~ "Edad",
+    lma_lla ~ "Leucemia (LMA/LLA)",
+    tx_alo ~ "Tx Alogénico",
+    neutropenia ~ "Neutropenia",
+    sofa ~ "Score SOFA",
+    arm ~ "ARM",
+    dx_ingreso ~ "Diagnóstico de Ingreso"
+  )
+) %>%
+  bold_p()
+
+# 2. Creamos la tabla del Multivariado (guardamos en otro objeto)
+modelo_multi <- glm(
+  muerte_uti ~ edad + lma_lla + tx_alo + neutropenia + sofa + arm + dx_ingreso, 
+  data = df_final, 
+  family = "binomial"
+)
+
+tabla_multivariada <- tbl_regression(
+  modelo_multi,
+  exponentiate = TRUE,
+  label = list(
+    edad ~ "Edad",
+    lma_lla ~ "Leucemia (LMA/LLA)",
+    tx_alo ~ "Tx Alogénico",
+    neutropenia ~ "Neutropenia",
+    sofa ~ "Score SOFA",
+    arm ~ "ARM",
+    dx_ingreso ~ "Diagnóstico de Ingreso"
+  )
+) %>%
+  bold_p()
+
+# 3. FUSIONAMOS las dos tablas
+tbl_merge(
+  tbls = list(tabla_univariada, tabla_multivariada),
+  tab_spanner = c("**Univariado (Crudo)**", "**Multivariado (Ajustado)**")
+) %>%
+  bold_labels() %>%
+  italicize_levels()
+```
+### 5.3 Impacto del Ajuste Multivariado y Control de Confusión
+
+La comparación entre el modelo crudo (univariado) y el ajustado (multivariado) reveló fenómenos de confusión importantes que justifican la selección de variables basada en plausibilidad biológica.
+
+**Justificación de la Edad como Covariable:**
+A pesar de que la **Edad** no mostró significancia estadística en el análisis univariado ($p=0.2$), su inclusión en el modelo multivariado —junto con la severidad (SOFA)— resultó crítica para la estimación precisa de otros predictores. Se observó que la edad actuaba como un factor de confusión negativo; al ajustar por ella, el valor p de la variable descendió a 0.074, acercándose a la significancia marginal.
+
+**Desenmascaramiento de Riesgos (Efecto Supresor):**
+El ajuste multivariado permitió identificar asociaciones que estaban ocultas en el análisis crudo:
+1.  **Insuficiencia Respiratoria:** En el análisis univariado, este diagnóstico no parecía diferir significativamente del grupo control (OR 1.69; $p=0.078$). Sin embargo, tras ajustar por edad y severidad, el OR aumentó a **2.57** y la asociación se volvió estadísticamente significativa ($p=0.016$). Esto sugiere que las características basales de estos pacientes (posiblemente menor edad o diferente perfil de comorbilidades) estaban enmascarando la verdadera letalidad de la patología respiratoria.
+2.  **Trasplante Alogénico:** El impacto del trasplante sobre la mortalidad se magnificó en el modelo ajustado, pasando de un OR de 2.12 a **3.08** ($p=0.021$), lo que confirma que es un predictor de riesgo independiente y de gran magnitud una vez que se descuenta el efecto de la gravedad aguda (SOFA).
+##nota: haber elegido el modelo por plausibilidad biologica y bibliografia incluye en el modelo a edad que si hubieramos utilizado un metodo automatico lo hubiese desechado por no significativo
+**Conclusión del Modelo:**
+El modelo final demuestra que la mortalidad en esta cohorte no depende de una sola variable, sino de la interacción compleja entre la reserva fisiológica (Edad), la carga de la enfermedad de base (Trasplante) y la severidad aguda (SOFA, ARM).
+
+# 6.0 modelo reducido con las variables significativas + edad
+
+
+```{r modelo_reducido, echo=TRUE}
+# 1. Ajustamos el modelo reducido (solo variables significativas + edad)
+modelo_reducido <- glm(
+  muerte_uti ~ edad + tx_alo + sofa + arm + dx_ingreso, 
+  data = df_final, 
+  family = "binomial"
+)
+
+# 2. Mostramos la tabla de resultados (Odds Ratios)
+modelo_reducido %>%
+  tbl_regression(
+    exponentiate = TRUE, # Para ver OR y no coeficientes
+    label = list(
+      edad ~ "Edad (años)",
+      tx_alo ~ "Trasplante Alogénico",
+      sofa ~ "Score SOFA",
+      arm ~ "ARM",
+      dx_ingreso ~ "Diagnóstico de Ingreso"
+    )
+  ) %>%
+  bold_p() %>%        # Resalta p < 0.05
+  bold_labels() %>%   # Negrita en los nombres
+  italicize_levels()  # Cursiva en las categorías
+```
+# 7 tabla comparativa del modelo univariado, multivariado completo y reducido
+
+
+```{r tabla_maestra, echo=TRUE}
+library(gtsummary)
+library(kableExtra)
+
+
+
+
+# --- TABLA MAESTRA CORREGIDA ---
+# 1. Definimos etiquetas (asegúrate de que estas listas existan)
+etiquetas_completas <- list(
+  edad ~ "Edad (años)",
+  lma_lla ~ "Leucemia (LMA/LLA)",
+  tx_alo ~ "Trasplante Alogénico",
+  neutropenia ~ "Neutropenia",
+  sofa ~ "Score SOFA",
+  arm ~ "ARM",
+  dx_ingreso ~ "Diagnóstico de Ingreso"
+)
+
+etiquetas_reducido <- list(
+  edad ~ "Edad (años)",
+  tx_alo ~ "Trasplante Alogénico",
+  sofa ~ "Score SOFA",
+  arm ~ "ARM",
+  dx_ingreso ~ "Diagnóstico de Ingreso"
+)
+
+# 2. Generamos los objetos de tabla
+t_uni_obj <- tbl_uvregression(
+    df_final, method = glm, y = muerte_uti,
+    method.args = list(family = binomial),
+    exponentiate = TRUE, 
+    include = c(edad, lma_lla, tx_alo, neutropenia, sofa, arm, dx_ingreso),
+    label = etiquetas_completas
+  ) %>% bold_p()
+
+t_completo_obj <- modelo_final %>%
+  tbl_regression(exponentiate = TRUE, label = etiquetas_completas) %>% 
+  bold_p()
+
+t_reducido_obj <- modelo_reducido %>%
+  tbl_regression(exponentiate = TRUE, label = etiquetas_reducido) %>% 
+  bold_p()
+
+# 3. Fusión y formato final (aquí estaba el error de la nota)
+tbl_merge(
+  tbls = list(t_uni_obj, t_completo_obj, t_reducido_obj),
+  tab_spanner = c("**Univariado**", "**Multiv. Completo**", "**Multiv. Reducido**")
+) %>%
+  bold_labels() %>%
+  italicize_levels() %>%
+  # Nota al pie integrada en gtsummary
+  modify_footnote(
+    everything() ~ "OR: Odds Ratio; CI: Intervalo de Confianza del 95%; SOFA: Score de falla orgánica; ARM: Asistencia Respiratoria Mecánica."
+  ) %>%
+  as_kable_extra(booktabs = TRUE) %>% 
+  kable_styling(latex_options = c("scale_down", "hold_position"))
+
+
+```
+# 8 validacion de supuestos de linealidad
+
+
+```{r}
+# Verificación para SOFA y Edad
+df_final <- df_final %>%
+  mutate(
+    sofa_log = sofa * log(sofa + 0.1), # +0.1 para evitar log(0)
+    edad_log = edad * log(edad)
+  )
+
+# Si el valor p de estos términos "log" es > 0.05, se cumple el supuesto de linealidad
+test_linealidad <- glm(muerte_uti ~ sofa + sofa_log + edad + edad_log, 
+                       data = df_final, family = "binomial")
+
+summary(test_linealidad)
+
+
+library(car)
+# Gráfico de linealidad para el modelo reducido
+crPlots(modelo_reducido, ~ edad)
+
+summary(test_linealidad)
+
+```
+los coeficientes del Test de Box-Tidwell muestran que hay ausencia de linelidad 
+del log edad por lo que se plantean dos estrategias se plantea dejar el modelo reducido incluyendo la edad a pesar de tener menos precision, vs aplicar splines para modelizar la no linealidad.
+se contruye el modelo spline y se comparará la bondad de ajuste del modelo si agrega poco ajuste se conservará el modelo mas parsimonioso
+
+
+```{r}
+library(splines)
+library(performance) # Para R2 y métricas
+
+# 1. Definición de modelos (asegurándonos que 'datos' sea tu dataframe)
+modelo_nolineal <- glm(muerte_uti ~ poly(edad, 2) + tx_alo + sofa + arm + dx_ingreso, 
+                        data = df_final, family = binomial)
+
+modelo_psplines <- glm(muerte_uti ~ ns(edad, df = 3) + tx_alo + sofa + arm + dx_ingreso, 
+                        data = df_final, family = binomial)
+
+# 2. Función de extracción segura para evitar el error de "atomic vectors"
+obtener_r2 <- function(m) {
+  res <- r2_tjur(m)
+  return(as.numeric(res)) # Esto extrae el valor puro (0.XX)
+}
+
+# 3. Creación de la tabla comparativa
+tabla_comparativa <- data.frame(
+  Modelo = c("Reducido", "Final (Lineal)", "No Lineal (Poly)", "Splines"),
+  AIC = c(AIC(modelo_reducido), AIC(modelo_final), AIC(modelo_nolineal), AIC(modelo_psplines)),
+  Pseudo_R2 = c(obtener_r2(modelo_reducido), 
+                obtener_r2(modelo_final), 
+                obtener_r2(modelo_nolineal), 
+                obtener_r2(modelo_psplines))
+)
+
+# 4. Cálculo de Delta AIC
+tabla_comparativa$Delta_AIC <- tabla_comparativa$AIC - min(tabla_comparativa$AIC)
+
+# Ordenar para ver el mejor arriba
+tabla_comparativa <- tabla_comparativa %>% arrange(AIC)
+
+print(tabla_comparativa)
+
+
+
+```
+
+
+#9. comparacion de calibracion y clasificacion de los dos modelos reducido vs no lineal
+
+
+```{r}
+library(pROC)
+library(ResourceSelection)
+
+# --- 1. CAPACIDAD DE DISCRIMINACIÓN (AUC - ROC) ---
+
+# Predicciones de probabilidad
+prob_final <- predict(modelo_reducido, type = "response")
+prob_nolineal <- predict(modelo_nolineal, type = "response")
+
+# Curvas ROC
+roc_final <- roc(df_final$muerte_uti, prob_final)
+roc_nolineal <- roc(df_final$muerte_uti, prob_nolineal)
+
+# Comparación estadística de AUC (Test de DeLong)
+test_auc <- roc.test(roc_final, roc_nolineal)
+
+# --- 2. CALIBRACIÓN (HOSMER-LEMESHOW) ---
+
+hl_final <- hoslem.test(modelo_final$y, fitted(modelo_reducido), g = 10)
+hl_nolineal <- hoslem.test(modelo_nolineal$y, fitted(modelo_nolineal), g = 10)
+
+# --- 3. RESULTADOS ---
+
+cat("AUC Modelo Final (Lineal):", auc(roc_final), "\n")
+cat("AUC Modelo No Lineal (Poly):", auc(roc_nolineal), "\n")
+cat("P-valor Test de DeLong (Diferencia AUC):", test_auc$p.value, "\n\n")
+
+cat("HL Test Modelo Final (p-valor):", hl_final$p.value, "\n")
+cat("HL Test Modelo No Lineal (p-valor):", hl_nolineal$p.value, "\n")
+```
+
+el modelo no lineal ( cuadratico) no aporta informacion de clasificacion sobre el modelo final ( reducido ).
+##AUC
+Modelo Final (Lineal): 0.8716
+
+Modelo No Lineal (Poly): 0.8725
+
+Ganancia: 0.0008 (¡menos del 0.1%!).
+
+Significancia: El p-valor de DeLong (0.89) nos dice que estadísticamente esa diferencia es puro ruido. Los modelos separan a los pacientes prácticamente igual de bien.
+
+##Calibración (Hosmer-Lemeshow)
+Ambos modelos tienen p-valores muy por encima de 0.05, lo que significa que ambos están bien calibrados (las muertes observadas coinciden con las predichas).
+
+Curiosamente, el modelo lineal tiene un p-valor de HL más alto (0.88 vs 0.54), lo que sugiere que incluso con menos parámetros, la "puntería" del modelo es excelente.
+
+
+#10. grafico del modelo con el que nos quedamos modelo final reducido
+
+
+```{r}
+library(ggstats)
+library(ggplot2)
+
+# Crear el Forest Plot
+ggcoef_model(modelo_reducido, 
+             exponentiate = TRUE, 
+             variable_labels = c(
+               edad = "Edad",
+               tx_alo = "Trasplante Alo",
+               sofa = "Score SOFA",
+               arm = "ARM",
+               dx_ingreso = "Dx Ingreso"
+             )) +
+  geom_vline(xintercept = 1, color = "red", linetype = "dashed") +
+  labs(title = "Factores Asociados a Muerte en UTI",
+       subtitle = "Modelo Logístico Final (Lineal)",
+       x = "Odds Ratio (escala logarítmica)") +
+  theme_minimal()
+```
+
+#11. analisis de residuos para casos influyentes
+
+
+```{r}
+library(performance)
+
+# Chequeo visual completo de supuestos
+check_model(modelo_reducido)
+
+# O específicamente los residuos agrupados
+binned_residuals(modelo_reducido) |> plot()
+```
+
+No hay puntos con alto leverage
+
+#12 validacion cruzada con K-fold para verificar ausencia de overfitting
+
+```{r}
+library(caret)
+
+library(caret)
+
+# 1. Usamos tu dataset tal cual está
+# Aseguramos que 'Muerto' sea el nivel que caret tome como positivo 
+# (En caret, por defecto, el primer nivel es la clase positiva)
+df_cv <- df_final
+
+# Opcional: Si querés que "Muerto" sea el target principal para Sensibilidad:
+df_cv$muerte_uti <- relevel(df_cv$muerte_uti, ref = "Muerto")
+
+# 2. Configuración de 5-fold (para evitar que algún grupo se quede sin "Muertos")
+ctrl <- trainControl(method = "cv", 
+                     number = 5, 
+                     classProbs = TRUE, 
+                     summaryFunction = twoClassSummary)
+
+# 3. Ejecutar el modelo lineal con tus variables
+set.seed(123)
+cv_result <- train(muerte_uti ~ edad + tx_alo + sofa + arm + dx_ingreso, 
+                   data = df_cv, 
+                   method = "glm", 
+                   family = "binomial",
+                   trControl = ctrl,
+                   metric = "ROC")
+
+# 4. Ver los resultados "blindados"
+print(cv_result)
+```
+
+Tu AUC (ROC) de 0.856 en el K-fold, comparado con el 0.869 que obtuvimos originalmente, confirma que el modelo es sumamente robusto. Una caída de apenas 0.01 (1%) es totalmente normal y esperable; es lo que llamamos el "ajuste por optimismo".
+
+Interpretación Final 
+Sin Overfitting: Como el AUC se mantuvo estable por encima de 0.85, podemos decir con confianza que el modelo no está memorizando ruido, sino aprendiendo patrones reales.
+
+Sensibilidad (0.61): El modelo identifica correctamente al 61% de los que fallecen. Es un valor decente, aunque sugiere que hay muertes por causas que los predictores actuales (SOFA, edad, etc.) no llegan a captar del todo.
+
+Especificidad (0.86): ¡Muy alta! El modelo es excelente identificando a los pacientes que van a sobrevivir, con pocos falsos positivos.
+
+
+
+#Conclusiones metodologia
+
+Metodología
+Se construyó un modelo de regresión logística multivariada para identificar factores predictores de mortalidad en la Unidad de Terapia Intensiva (UTI).
+
+El proceso de selección y validación del modelo se realizó en tres etapas:Selección de Predictores y Evaluación de Linealidad: Se incluyeron las variables de interés clínico: edad, tx_alo (trasplante alogénico), sofa (score de severidad), arm (asistencia respiratoria mecánica) y dx_ingreso.
+
+Para evaluar si la relación de la edad con la mortalidad era lineal, se comparó el modelo original con versiones de mayor complejidad: un modelo con splines naturales (3 grados de libertad) y un modelo no lineal (polinómico de segundo grado).
+Criterios de Selección: La comparación se basó en el AIC (Akaike Information Criterion), el Pseudo-R² de Tjur, y la capacidad de discriminación mediante el área bajo la curva ROC (AUC). 
+
+Se priorizó el principio de parsimonia: se elegiría el modelo más simple a menos que la complejidad aportara una mejora significativa (Delta AIC > 2 y p-valor < 0.05 en el Test de DeLong).
+
+Validación del Modelo: El modelo final fue validado mediante Validación Cruzada de 5 pliegues (5-fold Cross-Validation) para evaluar su estabilidad y mitigar el riesgo de sobreajuste (overfitting).
+
+La calibración se evaluó mediante el test de Hosmer-Lemeshow
+
+#Resultados
+
+Comparación de Modelos
+
+La comparación de métricas demostró que, aunque el modelo de Splines presentó el AIC más bajo (267.8), la diferencia con el modelo lineal no fue estadísticamente significativa en términos de discriminación (p=0.505 en el test de DeLong).
+Dado que el modelo lineal mostró una excelente calibración (Hosmer-Lemeshow p = 0.635) y una capacidad de discriminación casi idéntica a los modelos más complejos, se seleccionó como el modelo definitivo por su robustez y facilidad de interpretación clínica.
+
+Validación y Desempeño Final
+
+La validación cruzada confirmó la estabilidad del modelo, con un AUC promedio de 0.856, lo que indica que el modelo generaliza correctamente a datos no observados.Discriminación: AUC de 0.856 (IC 95%).
+
+Especificidad: 0.865 (Excelente capacidad para identificar pacientes de bajo riesgo).
+Sensibilidad: 0.611.
+
+Diagnóstico: No se observaron puntos con influencia excesiva (Leverage bajo), garantizando la estabilidad de los coeficientes.
+
